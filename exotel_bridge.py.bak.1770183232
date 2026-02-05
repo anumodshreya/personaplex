@@ -1,0 +1,192 @@
+import asyncio, json, base64, os
+import websockets
+
+PORT = int(os.getenv("BRIDGE_PORT", "5050"))
+
+# 100ms of silence at 8kHz PCM16 mono = 800 samples * 2 bytes = 1600 bytes
+SILENCE_100MS = b"\x00" * 1600
+
+async def handler(ws):
+    """
+    Exotel-style WS handler:
+      - receives JSON {"event":"media","media":{"payload": base64(PCM16LE 8k mono)}}
+      - sends the same JSON back for outbound audio
+    PersonaPlex side:
+      - binary websocket frames (bytes)
+    """
+    pp_ws = None
+    pcm_to_opus = None
+    opus_to_pcm = None
+
+    try:
+        pp_ws = await connect_personaplex()
+        print("[bridge] connected to PersonaPlex", flush=True)
+
+        pcm_to_opus = start_pcm_to_oggopus()
+        opus_to_pcm = start_oggopus_to_pcm()
+
+        loop = asyncio.get_event_loop()
+
+        async def exotel_recv_pcm():
+            async for msg in ws:
+                # Exotel sends text frames (JSON)
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+                if data.get("event") != "media":
+                    continue
+                media = data.get("media") or {}
+                payload = media.get("payload")
+                if not payload:
+                    continue
+                pcm = base64.b64decode(payload)
+                try:
+                    pcm_to_opus.stdin.write(pcm)
+                except Exception:
+                    break
+
+        async def ffmpeg_opus_out_to_personaplex():
+            # read ogg/opus bytes and forward to PersonaPlex
+            while True:
+                chunk = await loop.run_in_executor(None, pcm_to_opus.stdout.read, 4096)
+                if not chunk:
+                    break
+                try:
+                    await pp_ws.send(chunk)  # bytes
+                except Exception:
+                    break
+
+        async def personaplex_recv_to_ffmpeg():
+            while True:
+                try:
+                    msg = await pp_ws.recv()
+                except Exception:
+                    break
+                if isinstance(msg, (bytes, bytearray)):
+                    try:
+                        opus_to_pcm.stdin.write(msg)
+                    except Exception:
+                        break
+
+        async def ffmpeg_pcm_out_to_exotel():
+            # send PCM back to Exotel in 20ms frames: 8k * 0.02 * 2 bytes = 320 bytes
+            while True:
+                pcm = await loop.run_in_executor(None, opus_to_pcm.stdout.read, 320)
+                if not pcm:
+                    break
+                out = {
+                    "event": "media",
+                    "media": {"payload": base64.b64encode(pcm).decode("ascii")}
+                }
+                try:
+                    await ws.send(json.dumps(out))
+                except Exception:
+                    break
+
+        await asyncio.gather(
+            exotel_recv_pcm(),
+            ffmpeg_opus_out_to_personaplex(),
+            personaplex_recv_to_ffmpeg(),
+            ffmpeg_pcm_out_to_exotel(),
+        )
+
+    finally:
+        try:
+            if pp_ws:
+                await pp_ws.close()
+        except Exception:
+            pass
+        for proc in (pcm_to_opus, opus_to_pcm):
+            try:
+                if proc and proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                if proc and proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                if proc:
+                    proc.kill()
+            except Exception:
+                pass
+
+async def main():
+    print(f"[bridge] listening on 0.0.0.0:{PORT}")
+    async with websockets.serve(handler, "0.0.0.0", PORT, max_size=10_000_000):
+        await asyncio.Future()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# =========================
+# PersonaPlex binary adapter
+# =========================
+import ssl
+import struct
+
+def start_pcm_to_oggopus():
+    # Exotel PCM16 8k mono -> OGG/Opus 16k mono
+    return subprocess.Popen(
+        [
+            "ffmpeg",
+            "-loglevel", "quiet",
+            "-f", "s16le",
+            "-ar", "8000",
+            "-ac", "1",
+            "-i", "pipe:0",
+            "-c:a", "libopus",
+            "-ar", "16000",
+            "-ac", "1",
+            "-f", "ogg",
+            "pipe:1",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+
+def start_oggopus_to_pcm():
+    # OGG/Opus -> PCM16 8k mono (Exotel)
+    return subprocess.Popen(
+        [
+            "ffmpeg",
+            "-loglevel", "quiet",
+            "-f", "ogg",
+            "-i", "pipe:0",
+            "-f", "s16le",
+            "-ar", "8000",
+            "-ac", "1",
+            "pipe:1",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+
+PERSONAPLEX_WS = "wss://127.0.0.1:8998/api/chat"
+
+def _ssl_ctx_no_verify():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+async def connect_personaplex():
+    """
+    Connects to PersonaPlex (aiohttp) WS.
+    PersonaPlex expects *binary* messages and returns *binary* messages.
+    """
+    return await websockets.connect(
+        PERSONAPLEX_WS,
+        ssl=_ssl_ctx_no_verify(),
+        max_size=None,
+        ping_interval=20,
+        ping_timeout=20,
+    )
+
