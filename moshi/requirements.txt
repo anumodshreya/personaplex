@@ -1,9 +1,22 @@
+# --- Core AI Stack ---
+torch>=2.2.0,<2.5
 numpy>=1.26,<2.2
 safetensors>=0.4.0,<0.5
 huggingface-hub>=0.24,<0.25
-einops==0.7
 sentencepiece==0.2
-sounddevice==0.5
+einops==0.7
+
+# --- Audio & Codec ---
 sphn>=0.1.4,<0.2
-torch>=2.2.0,<2.5
+pyloudnorm==0.2.0
+scipy>=1.12.0
+sounddevice==0.5
+
+# --- Server & UI ---
 aiohttp>=3.10.5,<3.11
+websockets
+gradio>=4.0.0
+tqdm
+
+# --- System Utilities (Managed by Pip) ---
+accelerate>=0.26.0
