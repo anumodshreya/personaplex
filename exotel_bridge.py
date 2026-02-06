@@ -70,6 +70,11 @@ MODEL_SR = int(os.getenv("MODEL_SR", "24000"))  # PersonaPlex model sample rate
 EXOTEL_SR = int(os.getenv("EXOTEL_SR", "8000"))  # Exotel PCM sample rate
 AUDIO_CHUNK_MS = int(os.getenv("AUDIO_CHUNK_MS", "20"))  # 20ms chunks for Opus
 
+# Exotel lifecycle control (default OFF - safe changes only)
+EXOTEL_DRAIN_AFTER_STOP = os.getenv("EXOTEL_DRAIN_AFTER_STOP", "0") == "1"
+EXOTEL_DRAIN_SECS = float(os.getenv("EXOTEL_DRAIN_SECS", "8.0"))
+EXOTEL_SEND_SILENCE_WHEN_IDLE = os.getenv("EXOTEL_SEND_SILENCE_WHEN_IDLE", "0") == "1"
+
 # Build PersonaPlex WebSocket URL
 if "?" in ENGINE_URL:
     PERSONAPLEX_WS = f"{ENGINE_URL}&voice_prompt={quote(VOICE_PROMPT)}&text_prompt={quote(TEXT_PROMPT)}"
@@ -620,6 +625,14 @@ async def handler(exotel_ws, path=None):
     opus_reader = None
     tasks = []
     connection_active = True
+    stop_received_ts = None  # Timestamp when STOP event received
+    drain_mode = False  # True when in drain-after-STOP mode
+    
+    # Track timestamps for disconnect diagnosis
+    last_exotel_inbound_ts = None
+    last_exotel_outbound_ts = None
+    last_engine_inbound_ts = None
+    last_decoder_pcm_ts = None
     
     # Queues (defined once in handler scope - CREATE IMMEDIATELY)
     pcm8k_queue = asyncio.Queue(maxsize=500)  # Exotel PCM8k frames
@@ -664,6 +677,11 @@ async def handler(exotel_ws, path=None):
         
         if pp_ws is None:
             logger.error("Could not establish PersonaPlex connection")
+            import traceback
+            logger.info(
+                f"SERVER_INITIATED_EXOTEL_CLOSE: session={session_id} "
+                f"reason=personaplex_ws_none stack={traceback.format_stack()[-2:-1]}"
+            )
             await exotel_ws.close()
             return
         
@@ -685,6 +703,11 @@ async def handler(exotel_ws, path=None):
         
         if not handshake_received:
             logger.error("Did not receive PersonaPlex handshake")
+            import traceback
+            logger.info(
+                f"SERVER_INITIATED_EXOTEL_CLOSE: session={session_id} "
+                f"reason=personaplex_handshake_timeout stack={traceback.format_stack()[-2:-1]}"
+            )
             await exotel_ws.close()
             return
         
@@ -698,6 +721,11 @@ async def handler(exotel_ws, path=None):
             logger.info("Python resamplers initialized (no subprocess)")
         except Exception as e:
             logger.error(f"Failed to start resamplers: {e}", exc_info=True)
+            import traceback
+            logger.info(
+                f"SERVER_INITIATED_EXOTEL_CLOSE: session={session_id} "
+                f"reason=resampler_start_failed stack={traceback.format_stack()[-2:-1]}"
+            )
             await exotel_ws.close()
             return
         
@@ -1022,7 +1050,18 @@ async def handler(exotel_ws, path=None):
                         continue
                     
                     if event_type == "stop":
-                        logger.info("Exotel stop event received")
+                        stop_received_ts = time.monotonic()
+                        stop_ts = stop_received_ts
+                        ws_state = "open" if not exotel_ws.closed else "closed"
+                        logger.info(
+                            f"EXOTEL_STOP_EVENT: session={session_id} ts={stop_ts:.3f} "
+                            f"ws_state={ws_state} exotel_in_frames={obs.counters.get('exotel_in_frames', 0)} "
+                            f"exotel_out_frames={obs.counters.get('exotel_out_frames', 0)} "
+                            f"engine_audio_frames={obs.counters.get('engine_audio_frames', 0)} "
+                            f"decoder_pcm_bytes={obs.counters.get('decoder_out_pcm24k_bytes', 0)} "
+                            f"drain_after_stop={EXOTEL_DRAIN_AFTER_STOP} "
+                            f"next_action=break_exotel_to_engine_loop"
+                        )
                         # Send silence tail
                         silence_pcm8k = np.zeros(int(EXOTEL_SR * SILENCE_TAIL_MS / 1000), dtype=np.int16)
                         silence_bytes = silence_pcm8k.tobytes()
@@ -1030,6 +1069,15 @@ async def handler(exotel_ws, path=None):
                             pcm8k_queue.put_nowait(silence_bytes)
                         except asyncio.QueueFull:
                             pass
+                        # Signal end of input to pipeline
+                        try:
+                            await pcm8k_queue.put(None)
+                        except Exception:
+                            pass
+                        # If drain mode enabled, set flag but don't break yet
+                        if EXOTEL_DRAIN_AFTER_STOP:
+                            drain_mode = True
+                            logger.info(f"EXOTEL_DRAIN_MODE: Enabled, will drain for up to {EXOTEL_DRAIN_SECS}s")
                         break
                     
                     if event_type == "media":
@@ -1049,6 +1097,7 @@ async def handler(exotel_ws, path=None):
                             # PHASE 1: Live debugging - Exotel WS receive
                             print(f"[LIVE][EXOTEL_IN] bytes={len(pcm8k)} q_pcm8k={pcm8k_queue.qsize()} t={time.time()}")
                             logger.info(f"exotel_to_engine: received media frame {obs.counters['exotel_in_frames']}: {len(pcm8k)} bytes")
+                            last_exotel_inbound_ts = time.monotonic()
                             
                             # Artifact capture
                             if capture_enabled and 'exotel_in' in capture_files:
@@ -1478,6 +1527,7 @@ async def handler(exotel_ws, path=None):
         # Queues already created above
         async def engine_to_exotel():
             """Receive engine binary frames, decode Ogg Opus to PCM24k via FFmpeg, resample to 8k, send to Exotel."""
+            nonlocal last_engine_inbound_ts, last_decoder_pcm_ts, last_exotel_outbound_ts, stop_received_ts, drain_mode
             frame_log_count = 0
             last_exotel_out_time = time.time()
             chunk_size_8k = 320  # 20ms @ 8kHz = 160 samples * 2 bytes = 320 bytes
@@ -1495,6 +1545,7 @@ async def handler(exotel_ws, path=None):
                             # PHASE 1: Live debugging - engine_ws.recv()
                             if isinstance(msg, (bytes, bytearray)) and len(msg) > 0:
                                 print(f"[LIVE][ENGINE_RECV] bytes={len(msg)} t={time.time()}")
+                                last_engine_inbound_ts = time.monotonic()
                             last_frame_time = time.time()
                         except asyncio.TimeoutError:
                             # PHASE 1: Session watchdog
@@ -1610,13 +1661,16 @@ async def handler(exotel_ws, path=None):
                             try:
                                 payload = await asyncio.wait_for(opus_queue.get(), timeout=0.1)
                                 if payload is None:  # Sentinel to stop
-                                    # Close stdin to signal end of stream
+                                    # Close stdin to signal end of stream (allows FFmpeg to flush)
                                     if ogg_decoder.proc and ogg_decoder.proc.stdin:
                                         try:
                                             ogg_decoder.proc.stdin.close()
+                                            logger.info("FFmpeg decoder stdin closed, allowing flush of remaining data")
                                         except Exception:
                                             pass
-                                    return
+                                    # Don't return immediately - let read loop drain remaining data
+                                    # The read loop will detect stdin closed and continue until process exits
+                                    break
                                 ogg_buffer.extend(payload)
                                 packets_this_batch += 1
                             except asyncio.TimeoutError:
@@ -1649,9 +1703,24 @@ async def handler(exotel_ws, path=None):
                 try:
                     while connection_active:
                         # Continuously read from FFmpeg (non-blocking with timeout)
-                        pcm24k = await ogg_decoder.read(8192, timeout=0.2)
+                        # Use longer timeout to allow FFmpeg to flush buffered data
+                        pcm24k = await ogg_decoder.read(8192, timeout=1.0)
+                        
+                        if pcm24k:
+                            last_decoder_pcm_ts = time.monotonic()
                         
                         if not pcm24k:
+                            # Check if decoder stdin is closed (feed loop done) and process still alive
+                            # If so, continue reading to drain remaining buffered data
+                            if ogg_decoder.proc and ogg_decoder.proc.stdin and ogg_decoder.proc.stdin.closed:
+                                if ogg_decoder.proc.poll() is not None:
+                                    # Process exited, no more data
+                                    logger.info("FFmpeg decoder process exited, read loop done")
+                                    break
+                                # Process still alive but stdin closed - may have buffered data
+                                # Continue reading with shorter sleep
+                                await asyncio.sleep(0.01)
+                                continue
                             await asyncio.sleep(0.01)
                             continue
                         
@@ -1705,15 +1774,51 @@ async def handler(exotel_ws, path=None):
             
             # STAGE 3: Exotel send loop - drain pcm8k_queue and send JSON frames
             async def exotel_send_loop():
-                nonlocal last_exotel_out_time
+                nonlocal last_exotel_out_time, drain_mode, stop_received_ts
                 exotel_send_frames = 0
                 exotel_send_bytes = 0
+                last_silence_send_ts = None
                 try:
-                    while connection_active:
+                    while connection_active or (drain_mode and stop_received_ts is not None):
+                        # In drain mode, check exit conditions
+                        if drain_mode and stop_received_ts is not None:
+                            now = time.monotonic()
+                            elapsed = now - stop_received_ts
+                            if elapsed >= EXOTEL_DRAIN_SECS:
+                                logger.info(f"EXOTEL_DRAIN_MODE: Timeout ({EXOTEL_DRAIN_SECS}s) reached, exiting")
+                                drain_mode = False
+                                break
+                            # Check if playback finished (queue empty AND no new decoder audio for 500ms)
+                            if pcm_out_queue.qsize() == 0:
+                                time_since_decoder = now - last_decoder_pcm_ts if last_decoder_pcm_ts else float('inf')
+                                if time_since_decoder >= 0.5:
+                                    logger.info(f"EXOTEL_DRAIN_MODE: Playback finished (no decoder audio for {time_since_decoder:.2f}s), exiting")
+                                    drain_mode = False
+                                    break
+                        
                         try:
-                            pcm8k_chunk = await asyncio.wait_for(pcm_out_queue.get(), timeout=1.0)
+                            timeout = 0.2 if (drain_mode and EXOTEL_SEND_SILENCE_WHEN_IDLE) else 1.0
+                            pcm8k_chunk = await asyncio.wait_for(pcm_out_queue.get(), timeout=timeout)
                         except asyncio.TimeoutError:
-                            # Check for latency
+                            # In drain mode with silence keepalive, send silence frames
+                            if drain_mode and EXOTEL_SEND_SILENCE_WHEN_IDLE and not exotel_ws.closed:
+                                now = time.monotonic()
+                                if last_silence_send_ts is None or (now - last_silence_send_ts) >= 0.02:  # 20ms cadence
+                                    # Send valid silence frame (320 bytes @ 8kHz PCM)
+                                    silence_pcm8k = np.zeros(160, dtype=np.int16)  # 20ms @ 8kHz = 160 samples
+                                    silence_bytes = silence_pcm8k.tobytes()
+                                    payload_b64 = base64.b64encode(silence_bytes).decode("ascii")
+                                    media_frame = {"event": "media", "media": {"payload": payload_b64}}
+                                    try:
+                                        await exotel_ws.send(json.dumps(media_frame))
+                                        last_silence_send_ts = now
+                                        if int(now * 10) % 50 == 0:  # Log every 5s
+                                            logger.debug(f"EXOTEL_DRAIN_MODE: Sent silence keepalive frame")
+                                    except Exception:
+                                        pass  # Socket may be closed, will be caught below
+                                continue
+                            
+                            # Check for latency (non-drain mode)
                             now = time.monotonic()
                             if (now - last_exotel_out_time) > 3.0 and obs.counters['engine_audio_frames'] > 0 and obs.counters['exotel_out_frames'] == 0:
                                 logger.warning(
@@ -1730,11 +1835,17 @@ async def handler(exotel_ws, path=None):
                         }
                         
                         try:
+                            # Check if Exotel websocket is closed before sending
+                            if exotel_ws.closed:
+                                logger.warning("EXOTEL_SEND: Exotel websocket closed, cannot send")
+                                break
+                            
                             # PHASE 1: Live debugging - exotel_ws.send()
                             print(f"[LIVE][EXOTEL_OUT] bytes={len(pcm8k_chunk)} q_pcm_out={pcm_out_queue.qsize()} t={time.time()}")
                             await exotel_ws.send(json.dumps(media_frame))
                             exotel_send_frames += 1
                             exotel_send_bytes += len(pcm8k_chunk)
+                            last_exotel_outbound_ts = time.monotonic()
                             obs.update_counter('exotel_out_frames', delta=1, bytes_delta=len(pcm8k_chunk))
                             obs.update_activity('exotel_out')
                             last_exotel_out_time = time.monotonic()
@@ -1816,15 +1927,58 @@ async def handler(exotel_ws, path=None):
         
         # PHASE 2: Wait for Exotel client to close, NOT for any task to complete
         # The engine connection should stay open as long as Exotel client is connected
+        # OR during drain-after-STOP mode
         try:
             # Monitor Exotel client connection
-            while connection_active:
+            while connection_active or (drain_mode and stop_received_ts is not None):
                 try:
                     # Check if Exotel client is still connected
-                    await asyncio.wait_for(exotel_ws.wait_closed(), timeout=1.0)
+                    # In drain mode, use shorter timeout to check drain conditions
+                    timeout = 0.5 if drain_mode else 1.0
+                    await asyncio.wait_for(exotel_ws.wait_closed(), timeout=timeout)
+                    # Exotel closed the websocket - log with full context
+                    close_code = getattr(exotel_ws, 'close_code', None)
+                    close_reason = getattr(exotel_ws, 'close_reason', '')
+                    is_normal = close_code in (1000, 1001) if close_code else False
+                    logger.info(
+                        f"EXOTEL_CLIENT_DISCONNECTED: session={session_id} "
+                        f"close_code={close_code} close_reason={close_reason} is_normal={is_normal} "
+                        f"last_exotel_inbound={last_exotel_inbound_ts} "
+                        f"last_exotel_outbound={last_exotel_outbound_ts} "
+                        f"last_engine_inbound={last_engine_inbound_ts} "
+                        f"last_decoder_pcm={last_decoder_pcm_ts} "
+                        f"exotel_in_frames={obs.counters.get('exotel_in_frames', 0)} "
+                        f"exotel_out_frames={obs.counters.get('exotel_out_frames', 0)} "
+                        f"engine_audio_frames={obs.counters.get('engine_audio_frames', 0)} "
+                        f"decoder_pcm_bytes={obs.counters.get('decoder_out_pcm24k_bytes', 0)}"
+                    )
                     logger.info("Exotel client disconnected")
-                    break
+                    # In drain mode, socket close is expected - continue draining if enabled
+                    if drain_mode and EXOTEL_DRAIN_AFTER_STOP:
+                        logger.info("EXOTEL_DRAIN_MODE: Socket closed but drain mode active, continuing...")
+                        # Don't break - let drain mode exit naturally
+                    else:
+                        break
                 except asyncio.TimeoutError:
+                    # Client still connected (or in drain mode), check if any critical task died
+                    # In drain mode, also check drain exit conditions
+                    if drain_mode and stop_received_ts is not None:
+                        now = time.monotonic()
+                        elapsed = now - stop_received_ts
+                        if elapsed >= EXOTEL_DRAIN_SECS:
+                            logger.info(f"EXOTEL_DRAIN_MODE: Timeout reached, ending drain")
+                            drain_mode = False
+                            connection_active = False
+                            break
+                        # Check if playback finished
+                        if pcm_out_queue.qsize() == 0:
+                            time_since_decoder = now - last_decoder_pcm_ts if last_decoder_pcm_ts else float('inf')
+                            if time_since_decoder >= 0.5:
+                                logger.info(f"EXOTEL_DRAIN_MODE: Playback finished, ending drain")
+                                drain_mode = False
+                                connection_active = False
+                                break
+                    
                     # Client still connected, check if any critical task died
                     for task in tasks:
                         if task.done():

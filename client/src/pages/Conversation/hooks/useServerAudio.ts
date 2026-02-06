@@ -83,21 +83,38 @@ export const useServerAudio = ({setGetAudioStats}: useServerAudioArgs) => {
   );
 
   let midx = 0;
+  const audioBytesReceived = useRef(0);
+  const audioFramesReceived = useRef(0);
+  const lastClientLogTime = useRef(Date.now());
+  
   const decodeAudio = useCallback((data: Uint8Array) => {
     if (!decoderWorker.current) {
       console.warn("Decoder worker not ready, dropping audio packet");
       return;
     }
-    if (midx < 5) {
-      // Log first few packets with size info for debugging
-      const hasOggS = data.length >= 4 && 
-        data[0] === 0x4F && data[1] === 0x67 && data[2] === 0x67 && data[3] === 0x53;
-      console.log(Date.now() % 1000, "Got NETWORK message", 
-        micDuration.current - workletStats.current.actualAudioPlayed, 
-        midx++, 
-        "size:", data.length, 
-        "hasOggS:", hasOggS);
+    
+    // Log every message with size and OggS check
+    const hasOggS = data.length >= 4 && 
+      data[0] === 0x4F && data[1] === 0x67 && data[2] === 0x67 && data[3] === 0x53;
+    console.log(Date.now() % 1000, "Got NETWORK message", 
+      "size:", data.length, 
+      "hasOggS:", hasOggS);
+    
+    audioBytesReceived.current += data.length;
+    audioFramesReceived.current += 1;
+    
+    // Log summary every 1 second
+    const now = Date.now();
+    if (now - lastClientLogTime.current >= 1000) {
+      const avgFrameSize = audioBytesReceived.current / audioFramesReceived.current;
+      console.log("CLIENT_AUDIO: total_bytes=", audioBytesReceived.current,
+        "frames=", audioFramesReceived.current,
+        "avg_frame_size=", avgFrameSize.toFixed(0));
+      audioBytesReceived.current = 0;
+      audioFramesReceived.current = 0;
+      lastClientLogTime.current = now;
     }
+    
     decoderWorker.current.postMessage(
       {
         command: "decode",
@@ -130,6 +147,9 @@ export const useServerAudio = ({setGetAudioStats}: useServerAudioArgs) => {
     startRecording();
     currentSocket.addEventListener("message", onSocketMessage);
     totalAudioMessages.current = 0;
+    audioBytesReceived.current = 0;
+    audioFramesReceived.current = 0;
+    lastClientLogTime.current = Date.now();
     return () => {
       console.log("Stop recording called in unknown function.")
       stopRecording();

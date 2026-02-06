@@ -241,14 +241,141 @@ class ServerState:
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
 
+        def extract_ogg_pages(buffer: bytearray) -> tuple[list[bytes], bytearray]:
+            """
+            Extract complete Ogg pages from buffer.
+            Returns: (pages, remaining_buffer)
+            """
+            pages = []
+            remaining = bytearray()
+            
+            # Find first "OggS" magic
+            oggs_pos = buffer.find(b"OggS")
+            if oggs_pos < 0:
+                # No OggS found, keep last 3 bytes for boundary matching
+                if len(buffer) >= 3:
+                    return [], buffer[-3:]
+                return [], buffer
+            
+            # Drop any junk before first OggS
+            if oggs_pos > 0:
+                remaining = buffer[oggs_pos:]
+            else:
+                remaining = buffer
+            
+            # Extract complete pages
+            while len(remaining) >= 27:  # Minimum Ogg page header size
+                if remaining[0:4] != b"OggS":
+                    # Lost sync, find next OggS
+                    next_oggs = remaining.find(b"OggS", 1)
+                    if next_oggs < 0:
+                        # No more OggS found, keep last 3 bytes
+                        if len(remaining) >= 3:
+                            remaining = remaining[-3:]
+                        break
+                    remaining = remaining[next_oggs:]
+                    continue
+                
+                # Parse Ogg page header
+                if len(remaining) < 27:
+                    break  # Not enough for header
+                
+                page_segments = remaining[26]  # Byte at offset 26
+                segment_table_start = 27
+                segment_table_end = segment_table_start + page_segments
+                
+                if len(remaining) < segment_table_end:
+                    break  # Not enough for segment table
+                
+                # Calculate total payload length (sum of segment sizes)
+                payload_length = 0
+                for i in range(segment_table_start, segment_table_end):
+                    payload_length += remaining[i]
+                
+                # Full page length = header (27) + segment table (page_segments) + payload
+                full_page_length = 27 + page_segments + payload_length
+                
+                if len(remaining) < full_page_length:
+                    break  # Not enough for complete page
+                
+                # Extract complete page
+                page = bytes(remaining[:full_page_length])
+                pages.append(page)
+                remaining = remaining[full_page_length:]
+            
+            return pages, remaining
+
         async def send_loop():
+            clog.log("info", "SEND_LOOP_PATCH_ACTIVE a7f3b9c2d1e4")
+            ogg_buffer = bytearray()
+            last_log_time = time.time()
+            bytes_in_this_second = 0
+            pages_extracted_this_second = 0
+            bytes_sent_this_second = 0
+            buffer_before_log = 0
+            buffer_after_log = 0
+            no_pages_duration = 0.0
+            last_no_pages_time = None
+            bytes_in_total = 0
+            pages_sent_total = 0
+            bytes_sent_total = 0
+            
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
-                    await ws.send_bytes(b"\x01" + msg)
+                    bytes_in_this_second += len(msg)
+                    bytes_in_total += len(msg)
+                    
+                    # Safety cap: prevent unbounded buffer growth
+                    if len(ogg_buffer) > 1048576:  # 1MB
+                        ogg_buffer = ogg_buffer[-3:] if len(ogg_buffer) >= 3 else bytearray()
+                    
+                    buffer_before_log = len(ogg_buffer)
+                    ogg_buffer.extend(msg)
+                    pages, ogg_buffer = extract_ogg_pages(ogg_buffer)
+                    buffer_after_log = len(ogg_buffer)
+                    pages_extracted_this_second += len(pages)
+                    pages_sent_total += len(pages)
+                    
+                    # Track when no pages extracted while bytes continue
+                    if len(pages) == 0:
+                        if last_no_pages_time is None:
+                            last_no_pages_time = time.time()
+                    else:
+                        if last_no_pages_time is not None:
+                            no_pages_duration = time.time() - last_no_pages_time
+                            if no_pages_duration > 1.0:
+                                clog.log("info", 
+                                    f"send_loop: No pages extracted for {no_pages_duration:.2f}s "
+                                    f"while bytes_in={bytes_in_this_second}B buffer={buffer_before_log}->{buffer_after_log}")
+                            last_no_pages_time = None
+                            no_pages_duration = 0.0
+                    
+                    for page in pages:
+                        await ws.send_bytes(b"\x01" + page)
+                        bytes_sent_this_second += len(page)
+                        bytes_sent_total += len(page)
+                
+                # Log every 1 second
+                now = time.time()
+                if now - last_log_time >= 1.0:
+                    avg_page_size = bytes_sent_total / pages_sent_total if pages_sent_total > 0 else 0
+                    clog.log("info",
+                        f"send_loop: bytes_in_total={bytes_in_total}B "
+                        f"ogg_buffer_len={buffer_after_log} "
+                        f"pages_extracted={pages_extracted_this_second} "
+                        f"bytes_sent_total={bytes_sent_total}B "
+                        f"avg_page_size={avg_page_size:.0f}B")
+                    if pages_extracted_this_second == 0 and bytes_in_this_second > 0:
+                        clog.log("info",
+                            f"send_loop: STALLED - pages_extracted=0 while bytes_in={bytes_in_this_second}B")
+                    bytes_in_this_second = 0
+                    pages_extracted_this_second = 0
+                    bytes_sent_this_second = 0
+                    last_log_time = now
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
