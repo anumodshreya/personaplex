@@ -75,6 +75,20 @@ EXOTEL_DRAIN_AFTER_STOP = os.getenv("EXOTEL_DRAIN_AFTER_STOP", "0") == "1"
 EXOTEL_DRAIN_SECS = float(os.getenv("EXOTEL_DRAIN_SECS", "8.0"))
 EXOTEL_SEND_SILENCE_WHEN_IDLE = os.getenv("EXOTEL_SEND_SILENCE_WHEN_IDLE", "0") == "1"
 
+# Audio pipeline mode (experimental)
+# DEPRECATED: raw_opus_experiment abandoned due to architectural incompatibility.
+# Validation test (2026-02-09) showed AttributeError failures due to missing .proc
+# attributes in RawOpusEncoder/Decoder classes. The experimental mode assumes FFmpeg
+# subprocess semantics but uses pure Python opuslib, causing critical failures.
+# RECOMMENDATION: Use 'ogg' mode only (production-stable).
+AUDIO_PIPELINE_MODE = os.getenv("AUDIO_PIPELINE_MODE", "ogg")
+ALLOWED_PIPELINE_MODES = {"ogg", "raw_opus_experiment"}
+if AUDIO_PIPELINE_MODE not in ALLOWED_PIPELINE_MODES:
+    raise ValueError(
+        f"Invalid AUDIO_PIPELINE_MODE: {AUDIO_PIPELINE_MODE}. "
+        f"Allowed values: {', '.join(sorted(ALLOWED_PIPELINE_MODES))}"
+    )
+
 # Build PersonaPlex WebSocket URL
 if "?" in ENGINE_URL:
     PERSONAPLEX_WS = f"{ENGINE_URL}&voice_prompt={quote(VOICE_PROMPT)}&text_prompt={quote(TEXT_PROMPT)}"
@@ -102,7 +116,7 @@ class FfmpegOggDecoder:
                 [
                     "ffmpeg",
                     "-hide_banner",
-                    "-loglevel", "warning",
+                    "-loglevel", "info",
                     "-f", "ogg",
                     "-i", "pipe:0",
                     "-f", "s16le",
@@ -128,6 +142,9 @@ class FfmpegOggDecoder:
             )
             
             # Start stderr reader task
+            set_nonblocking(self.proc.stderr)
+            set_nonblocking(self.proc.stdout)
+            set_nonblocking(self.proc.stdin) # Also stdin for safety
             self.stderr_task = asyncio.create_task(self._stderr_reader())
         except FileNotFoundError:
             raise RuntimeError(f"ffmpeg not found. Install with: apt-get install -y ffmpeg")
@@ -140,12 +157,12 @@ class FfmpegOggDecoder:
             loop = asyncio.get_event_loop()
             while not self._closed and self.proc and self.proc.poll() is None:
                 try:
-                    line = await asyncio.wait_for(
-                        loop.run_in_executor(None, self.proc.stderr.readline),
-                        timeout=0.1
-                    )
-                    if line:
-                        line_str = line.decode(errors="ignore").strip()
+                    await asyncio.sleep(0.02)
+                    chunk = self.proc.stderr.read(256)
+                    if chunk is None:
+                        continue
+                    if chunk:
+                        line_str = chunk.decode(errors="ignore").strip()
                         if line_str:
                             logger.warning(f"[ffmpeg-{self.tag}] {line_str}")
                     elif self.proc.poll() is not None:
@@ -204,10 +221,10 @@ class FfmpegOggDecoder:
             return None
         try:
             loop = asyncio.get_event_loop()
-            data = await asyncio.wait_for(
-                loop.run_in_executor(None, self.proc.stdout.read, nbytes),
-                timeout=timeout
-            )
+            await asyncio.sleep(0.01)
+            data = self.proc.stdout.read(nbytes)
+            if data is None:
+                return b""
             if data:
                 self.read_total += len(data)
                 if self.observability:
@@ -567,6 +584,14 @@ def float32_to_int16_bytes(x: np.ndarray) -> bytes:
     y = (x * 32767.0).astype(np.int16)
     return y.tobytes()
 
+import fcntl
+def set_nonblocking(f):
+    """Set a file object to non-blocking mode."""
+    fd = f.fileno()
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+
 
 # ========== TASK WRAPPER WITH EXCEPTION LOGGING ==========
 async def run_task(name: str, coro):
@@ -597,6 +622,15 @@ async def handler(exotel_ws, path=None):
     
     # Initialize observability
     obs = PipelineObservability(session_id)
+    
+    # PHASE 4: Structured Diagnostics & Silence Watchdog
+    diagnostics = {
+        "last_exotel_in_ts": None,
+        "first_engine_audio_ts": None,
+        "last_engine_audio_ts": None,
+        "engine_audio_frames": 0,
+    }
+    
     
     # Artifact capture setup
     capture_enabled = os.getenv("CAPTURE", "0") == "1"
@@ -759,10 +793,13 @@ async def handler(exotel_ws, path=None):
                     command = [
                         "ffmpeg",
                         "-hide_banner",
-                        "-loglevel", "error",
+                        "-loglevel", "info",
                         "-f", "s16le",
                         "-ar", str(self.sample_rate),
                         "-ac", "1",
+                        "-probesize", "32",
+                        "-analyzeduration", "0",
+                        "-fflags", "nobuffer",
                         "-i", "pipe:0",
                         "-c:a", "libopus",
                         "-application", "voip",
@@ -771,6 +808,7 @@ async def handler(exotel_ws, path=None):
                         "-b:a", "24k",
                         "-flush_packets", "1",  # Force immediate packet output
                         "-f", "ogg",  # Ogg Opus format (matches engine output)
+                        "-page_duration", "20000",
                         "pipe:1"
                     ]
                     logger.info(f"Opus encoder cmd: {' '.join(shlex.quote(x) for x in command)}")
@@ -782,6 +820,10 @@ async def handler(exotel_ws, path=None):
                         stderr=subprocess.PIPE,
                         bufsize=0,
                     )
+                    # Important: set pipes to non-blocking to prevent deadlocks
+                    set_nonblocking(self.proc.stderr)
+                    set_nonblocking(self.proc.stdout)
+                    set_nonblocking(self.proc.stdin)
                     if self.proc.poll() is not None:
                         stderr = self.proc.stderr.read().decode(errors="ignore")
                         raise RuntimeError(f"{self.tag} exited immediately: {stderr}")
@@ -793,6 +835,7 @@ async def handler(exotel_ws, path=None):
                     )
                     
                     # STEP 3: Start async stderr reader task
+
                     self.stderr_task = asyncio.create_task(self._stderr_reader())
                     
                 except FileNotFoundError:
@@ -807,11 +850,11 @@ async def handler(exotel_ws, path=None):
                     line_buf = bytearray()
                     while not self._closed and self.proc and self.proc.poll() is None:
                         try:
-                            # Use read1 (non-blocking) with small chunks
-                            chunk = await asyncio.wait_for(
-                                loop.run_in_executor(None, lambda: self.proc.stderr.read1(256)),
-                                timeout=0.1
-                            )
+                            # Use read (blocking in thread) with small chunks
+                            await asyncio.sleep(0.02)
+                            chunk = self.proc.stderr.read(256)
+                            if chunk is None:
+                                continue
                             if chunk:
                                 self.stderr_buffer.extend(chunk)
                                 if len(self.stderr_buffer) > 1024:
@@ -876,17 +919,19 @@ async def handler(exotel_ws, path=None):
                     return None
                 try:
                     loop = asyncio.get_event_loop()
-                    # Try read1 first (non-blocking), fallback to read
-                    if hasattr(self.proc.stdout, 'read1'):
-                        data = await asyncio.wait_for(
-                            loop.run_in_executor(None, self.proc.stdout.read1, min(nbytes, 4096)),
-                            timeout=timeout
-                        )
-                    else:
-                        data = await asyncio.wait_for(
-                            loop.run_in_executor(None, self.proc.stdout.read, nbytes),
-                            timeout=timeout
-                        )
+                    # Non-blocking read loop
+                    start_time = time.monotonic()
+                    while True:
+                        await asyncio.sleep(0.01)
+                        data = self.proc.stdout.read(nbytes)
+                        if data:
+                            break
+                        if data is None: # EAGAIN / Empty
+                            if time.monotonic() - start_time > timeout:
+                                return b""
+                            continue
+                        # EOF (empty bytes)
+                        return b""
                     if data:
                         self.encode_out_bytes_total += len(data)
                         self.encode_out_chunks_total += 1
@@ -957,23 +1002,40 @@ async def handler(exotel_ws, path=None):
                         f"total_out={self.encode_out_bytes_total}b, chunks={self.encode_out_chunks_total}"
                     )
         
-        # Initialize FFmpeg Opus encoder
+        # Initialize Opus encoder (conditional based on pipeline mode)
         opus_encoder = None
         try:
-            opus_encoder = FfmpegOpusEncoder(MODEL_SR, observability=obs)
-            opus_encoder.start()
-            logger.info("FFmpeg Opus encoder started")
+            if AUDIO_PIPELINE_MODE == "raw_opus_experiment":
+                from raw_opus_encoder import RawOpusEncoder
+                opus_encoder = RawOpusEncoder(MODEL_SR, observability=obs)
+                opus_encoder.start()
+                logger.info("[EXPERIMENTAL] Raw Opus encoder started (bridge-only)")
+            elif AUDIO_PIPELINE_MODE == "ogg":
+                opus_encoder = FfmpegOpusEncoder(MODEL_SR, observability=obs)
+                opus_encoder.start()
+                logger.info("FFmpeg Opus encoder started (OGG mode)")
+            else:
+                raise ValueError(f"Invalid AUDIO_PIPELINE_MODE: {AUDIO_PIPELINE_MODE}")
         except Exception as e:
-            logger.error(f"Failed to start FFmpeg Opus encoder: {e}", exc_info=True)
+            logger.error(f"Failed to start Opus encoder ({AUDIO_PIPELINE_MODE} mode): {e}", exc_info=True)
             await exotel_ws.close()
             return
         
         # Keep sphn as fallback (not used if FFmpeg works)
         opus_writer = None
         
-        # Initialize FFmpeg Ogg decoder for inbound (Engine → Exotel)
-        ogg_decoder = FfmpegOggDecoder(observability=obs)
-        ogg_decoder.start()
+        # Initialize Ogg decoder for inbound (Engine → Exotel) - conditional based on pipeline mode
+        if AUDIO_PIPELINE_MODE == "raw_opus_experiment":
+            from raw_opus_decoder import RawOpusDecoder
+            ogg_decoder = RawOpusDecoder(observability=obs)
+            ogg_decoder.start()
+            logger.info("[EXPERIMENTAL] Raw Opus decoder started (bridge-only)")
+        elif AUDIO_PIPELINE_MODE == "ogg":
+            ogg_decoder = FfmpegOggDecoder(observability=obs)
+            ogg_decoder.start()
+            logger.info("FFmpeg Ogg decoder started (OGG mode)")
+        else:
+            raise ValueError(f"Invalid AUDIO_PIPELINE_MODE: {AUDIO_PIPELINE_MODE}")
         
         # Frame sizes
         # 20ms @ 24kHz = 480 samples = 960 bytes (PCM16LE)
@@ -1018,6 +1080,21 @@ async def handler(exotel_ws, path=None):
                 except Exception as e:
                     logger.exception(f"FATAL: heartbeat_task crashed: {e}")
                     raise
+
+        async def silence_watchdog():
+            """Monitor for dangerous silence gaps (risk of Exotel timeout)."""
+            logger.info("TASK_START: silence_watchdog")
+            try:
+                while True:
+                    await asyncio.sleep(0.2)
+                    if diagnostics["last_exotel_in_ts"] and diagnostics["engine_audio_frames"] > 0:
+                        # Only check if we have started receiving engine audio
+                        if diagnostics["last_engine_audio_ts"]:
+                            gap = time.time() - diagnostics["last_engine_audio_ts"]
+                            if gap > 1.0:
+                                logger.warning(f"[DIAG] Engine audio gap {gap:.2f}s (telephony risk)")
+            except asyncio.CancelledError:
+                logger.info("TASK_CANCEL: silence_watchdog")
         
         # ========== INBOUND: Exotel -> Engine ==========
         # Three-stage streaming pipeline with queues (queues already created above)
@@ -1047,6 +1124,8 @@ async def handler(exotel_ws, path=None):
                         logger.info("Exotel start event received")
                         obs.update_activity('exotel_in')
                         last_audio_time = time.monotonic()
+                        diagnostics["last_exotel_in_ts"] = time.time()
+                        logger.debug(f"[DIAG] EXOTEL_IN at {diagnostics['last_exotel_in_ts']:.3f}")
                         continue
                     
                     if event_type == "stop":
@@ -1093,6 +1172,7 @@ async def handler(exotel_ws, path=None):
                             obs.update_activity('exotel_in')
                             obs.update_activity('pcm8k')
                             last_audio_time = time.monotonic()
+                            diagnostics["last_exotel_in_ts"] = time.time()
                             
                             # PHASE 1: Live debugging - Exotel WS receive
                             print(f"[LIVE][EXOTEL_IN] bytes={len(pcm8k)} q_pcm8k={pcm8k_queue.qsize()} t={time.time()}")
@@ -1727,9 +1807,7 @@ async def handler(exotel_ws, path=None):
                         total_pcm24k_bytes += len(pcm24k)
                         iterations += 1
                         
-                        # PHASE 1: Live debugging - decode_loop after decoder.read()
-                        print(f"[LIVE][DECODE][OUT] bytes={len(pcm24k)} t={time.time()}")
-                        
+
                         if iterations <= 5:
                             logger.info(f"FFmpeg read: got {len(pcm24k)} bytes PCM24k (total: {total_pcm24k_bytes})")
                         
@@ -1767,8 +1845,6 @@ async def handler(exotel_ws, path=None):
                                     except asyncio.QueueFull:
                                         pass
                 except Exception as e:
-                    # PHASE 2: Live debugging - explicit exception handling
-                    print(f"[LIVE][ERROR][FFMPEG_READ] {repr(e)} t={time.time()}")
                     logger.error(f"ffmpeg_read_loop error: {e}", exc_info=True)
                     raise
             
@@ -1835,14 +1911,25 @@ async def handler(exotel_ws, path=None):
                         }
                         
                         try:
-                            # Check if Exotel websocket is closed before sending
-                            if exotel_ws.closed:
-                                logger.warning("EXOTEL_SEND: Exotel websocket closed, cannot send")
-                                break
+
                             
-                            # PHASE 1: Live debugging - exotel_ws.send()
-                            print(f"[LIVE][EXOTEL_OUT] bytes={len(pcm8k_chunk)} q_pcm_out={pcm_out_queue.qsize()} t={time.time()}")
                             await exotel_ws.send(json.dumps(media_frame))
+                            
+                            # Diagnostics: Update egress stats
+                            now = time.time()
+                            if diagnostics["engine_audio_frames"] == 0:
+                                diagnostics["first_engine_audio_ts"] = now
+                                if diagnostics["last_exotel_in_ts"]:
+                                    latency_ms = (now - diagnostics["last_exotel_in_ts"]) * 1000
+                                    logger.info(
+                                        f"[METRIC][{AUDIO_PIPELINE_MODE.upper()}][FIRST_AUDIO_LATENCY]={latency_ms:.1f}ms "
+                                        f"at {now:.3f}"
+                                    )
+                                else:
+                                    logger.info(f"[DIAG] FIRST_ENGINE_AUDIO at {now:.3f}")
+                            
+                            diagnostics["last_engine_audio_ts"] = now
+                            diagnostics["engine_audio_frames"] += 1
                             exotel_send_frames += 1
                             exotel_send_bytes += len(pcm8k_chunk)
                             last_exotel_outbound_ts = time.monotonic()
@@ -1860,13 +1947,9 @@ async def handler(exotel_ws, path=None):
                             if exotel_send_frames <= 10:
                                 logger.info(f"✓ Sent frame {exotel_send_frames} to Exotel: {len(pcm8k_chunk)} bytes")
                         except Exception as e:
-                            # PHASE 2: Live debugging - explicit exception handling
-                            print(f"[LIVE][ERROR][EXOTEL_SEND] {repr(e)} t={time.time()}")
                             logger.error(f"Failed to send to Exotel: {e}", exc_info=True)
                             raise
                 except Exception as e:
-                    # PHASE 2: Live debugging - explicit exception handling
-                    print(f"[LIVE][ERROR][EXOTEL_SEND_LOOP] {repr(e)} t={time.time()}")
                     logger.error(f"exotel_send_loop error: {e}", exc_info=True)
                     raise
                 finally:
@@ -1911,6 +1994,9 @@ async def handler(exotel_ws, path=None):
             
             task_heartbeat = asyncio.create_task(run_task("heartbeat", heartbeat_task()))
             logger.info("START task: heartbeat")
+            
+            task_watchdog = asyncio.create_task(run_task("silence_watchdog", silence_watchdog()))
+            logger.info("START task: silence_watchdog")
 
             tasks = [
                 task_keepalive,
@@ -1919,6 +2005,7 @@ async def handler(exotel_ws, path=None):
                 task_resample,
                 task_encode,
                 task_engine_recv,
+                task_watchdog,
             ]
             logger.info(f"PHASE 1: All {len(tasks)} tasks created and started")
         except Exception as e:
@@ -2019,6 +2106,11 @@ async def handler(exotel_ws, path=None):
     finally:
         # Cleanup
         connection_active = False
+        
+        logger.error(
+            f"[DIAG] CLIENT_DISCONNECTED close_code={exotel_ws.close_code} "
+            f"engine_audio_frames={diagnostics['engine_audio_frames']}"
+        )
         
         # Cancel and await all tasks safely
         # Note: 'tasks' is defined in the handler scope, so it should be accessible here

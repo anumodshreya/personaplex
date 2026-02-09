@@ -49,3 +49,20 @@
 2. **WebSocket closed fix:** Check logs for `EXOTEL_SEND: Exotel websocket closed` - should gracefully exit
 3. **Flush fix:** After STOP event, verify `DECODER_PCM` bytes continue increasing for ~1-2s after stdin close
 4. **End-to-end:** Caller should hear complete sentences without cut-off
+
+## 6️⃣ Latency Diagnosis (2026-02-09)
+
+**Objective:** Implement detailed diagnostic logging and silence watchdog to track audio pipeline latency.
+
+**Findings:**
+- **High Latency Confirmed:** `test_diagnostics.py` measured end-to-end latency at **~3.73s**.
+- **Silence Watchdog Active:** Logs show `[DIAG] Engine audio gap` warnings correctly identifying silence gaps > 1.0s.
+- **Timestamp Tracking:** `FIRST_ENGINE_AUDIO` and `last_exotel_in_ts` are correctly tracking media flow.
+
+**Log Analysis:**
+- **First Media In:** ~1770611183.175
+- **First Engine Audio:** 1770611186.909
+- **Total Latency:** ~3.73s
+
+**Conclusion:**
+The pipeline is functional but suffers from high latency (~3.7s), which is not viable for telephony. The new diagnostics successfully instrument the code to allow for pinpointing the bottlenecks (buffering, network, or model inference) in future optimization steps.
