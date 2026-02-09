@@ -656,6 +656,7 @@ async def handler(exotel_ws, path=None):
     connection_active = True
     stop_received_ts = None  # Timestamp when STOP event received
     drain_mode = False  # True when in drain-after-STOP mode
+    ogg_decoder = None  # Initialize to prevent UnboundLocalError in finally block
     
     # Track timestamps for disconnect diagnosis
     last_exotel_inbound_ts = None
@@ -716,7 +717,7 @@ async def handler(exotel_ws, path=None):
         
         # Wait for handshake (0x00 byte)
         handshake_received = False
-        for _ in range(150):  # 15 second timeout
+        for _ in range(450):  # 45 second timeout (0.1s steps)
             try:
                 msg = await asyncio.wait_for(pp_ws.recv(), timeout=0.1)
                 if isinstance(msg, (bytes, bytearray)) and len(msg) > 0:
