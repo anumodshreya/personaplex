@@ -76,11 +76,6 @@ EXOTEL_DRAIN_SECS = float(os.getenv("EXOTEL_DRAIN_SECS", "8.0"))
 EXOTEL_SEND_SILENCE_WHEN_IDLE = os.getenv("EXOTEL_SEND_SILENCE_WHEN_IDLE", "0") == "1"
 
 # Audio pipeline mode (experimental)
-# DEPRECATED: raw_opus_experiment abandoned due to architectural incompatibility.
-# Validation test (2026-02-09) showed AttributeError failures due to missing .proc
-# attributes in RawOpusEncoder/Decoder classes. The experimental mode assumes FFmpeg
-# subprocess semantics but uses pure Python opuslib, causing critical failures.
-# RECOMMENDATION: Use 'ogg' mode only (production-stable).
 AUDIO_PIPELINE_MODE = os.getenv("AUDIO_PIPELINE_MODE", "ogg")
 ALLOWED_PIPELINE_MODES = {"ogg", "raw_opus_experiment"}
 if AUDIO_PIPELINE_MODE not in ALLOWED_PIPELINE_MODES:
@@ -1131,7 +1126,8 @@ async def handler(exotel_ws, path=None):
                     if event_type == "stop":
                         stop_received_ts = time.monotonic()
                         stop_ts = stop_received_ts
-                        ws_state = "open" if not exotel_ws.closed else "closed"
+                        # Defensive WebSocket state check
+                        ws_state = "open" if not getattr(exotel_ws, 'closed', False) else "closed"
                         logger.info(
                             f"EXOTEL_STOP_EVENT: session={session_id} ts={stop_ts:.3f} "
                             f"ws_state={ws_state} exotel_in_frames={obs.counters.get('exotel_in_frames', 0)} "
@@ -1391,6 +1387,11 @@ async def handler(exotel_ws, path=None):
                     chunks_read += 1
                     total_drained += len(opus_chunk)
                     encode_out_chunks += 1
+                    
+                    # Wrap raw Opus in OGG for experimental mode
+                    if AUDIO_PIPELINE_MODE == "raw_opus_experiment":
+                        from raw_opus_encoder import wrap_opus_in_ogg
+                        opus_chunk = wrap_opus_in_ogg(opus_chunk)
                     
                     # Send to engine
                     try:
@@ -1853,7 +1854,11 @@ async def handler(exotel_ws, path=None):
                 nonlocal last_exotel_out_time, drain_mode, stop_received_ts
                 exotel_send_frames = 0
                 exotel_send_bytes = 0
-                last_silence_send_ts = None
+                cadence_silence_frames = 0
+                
+                # Clock-driven cadence: 20ms monotonic interval
+                next_send_ts = time.monotonic()
+                
                 try:
                     while connection_active or (drain_mode and stop_received_ts is not None):
                         # In drain mode, check exit conditions
@@ -1872,88 +1877,107 @@ async def handler(exotel_ws, path=None):
                                     drain_mode = False
                                     break
                         
+                        # Wait until next 20ms cadence tick
+                        now = time.monotonic()
+                        if now < next_send_ts:
+                            await asyncio.sleep(next_send_ts - now)
+                        # Drift correction: prevent accumulation over long runtimes
+                        next_send_ts = max(next_send_ts + 0.02, time.monotonic())
+                        
+                        # Try to get audio from queue (non-blocking)
+                        have_audio = False
+                        pcm8k_chunk = None
                         try:
-                            timeout = 0.2 if (drain_mode and EXOTEL_SEND_SILENCE_WHEN_IDLE) else 1.0
-                            pcm8k_chunk = await asyncio.wait_for(pcm_out_queue.get(), timeout=timeout)
-                        except asyncio.TimeoutError:
-                            # In drain mode with silence keepalive, send silence frames
-                            if drain_mode and EXOTEL_SEND_SILENCE_WHEN_IDLE and not exotel_ws.closed:
-                                now = time.monotonic()
-                                if last_silence_send_ts is None or (now - last_silence_send_ts) >= 0.02:  # 20ms cadence
-                                    # Send valid silence frame (320 bytes @ 8kHz PCM)
-                                    silence_pcm8k = np.zeros(160, dtype=np.int16)  # 20ms @ 8kHz = 160 samples
-                                    silence_bytes = silence_pcm8k.tobytes()
-                                    payload_b64 = base64.b64encode(silence_bytes).decode("ascii")
-                                    media_frame = {"event": "media", "media": {"payload": payload_b64}}
-                                    try:
-                                        await exotel_ws.send(json.dumps(media_frame))
-                                        last_silence_send_ts = now
-                                        if int(now * 10) % 50 == 0:  # Log every 5s
-                                            logger.debug(f"EXOTEL_DRAIN_MODE: Sent silence keepalive frame")
-                                    except Exception:
-                                        pass  # Socket may be closed, will be caught below
-                                continue
+                            pcm8k_chunk = pcm_out_queue.get_nowait()
+                            have_audio = True
+                        except asyncio.QueueEmpty:
+                            have_audio = False
+                        
+                        # Track whether this frame is silence
+                        is_silence = not have_audio
+                        
+                        # If no audio available, generate silence to maintain cadence
+                        if not have_audio:
+                            # Defensive WebSocket state check: exit cadence loop if connection closed
+                            # Default to False (Open) if 'closed' attribute is missing, to prevent false positives
+                            if not getattr(exotel_ws, 'closed', False):
+                                # Generate 20ms silence: 160 samples @ 8kHz = 320 bytes
+                                silence_pcm8k = np.zeros(160, dtype=np.int16)
+                                pcm8k_chunk = silence_pcm8k.tobytes()
+                                cadence_silence_frames += 1
+                                # Log first few and periodically
+                                if cadence_silence_frames <= 5 or cadence_silence_frames % 100 == 0:
+                                    logger.info(f"[CADENCE] Silence frame #{cadence_silence_frames} (engine idle)")
+                            else:
+                                # WebSocket closed - stop cadence loop to prevent audio blackhole
+                                logger.info(f"[CADENCE] WebSocket closed, exiting cadence loop (sent {cadence_silence_frames} silence frames)")
+                                break
+                        
+                        # Send the frame (real audio or silence)
+                        if pcm8k_chunk:
+                            # Encode to base64 and send JSON
+                            payload_b64 = base64.b64encode(pcm8k_chunk).decode("ascii")
+                            media_frame = {
+                                "event": "media",
+                                "media": {"payload": payload_b64}
+                            }
                             
-                            # Check for latency (non-drain mode)
-                            now = time.monotonic()
-                            if (now - last_exotel_out_time) > 3.0 and obs.counters['engine_audio_frames'] > 0 and obs.counters['exotel_out_frames'] == 0:
-                                logger.warning(
-                                    f"LATENCY: No exotel_out for {now - last_exotel_out_time:.1f}s "
-                                    f"while engine_audio={obs.counters['engine_audio_frames']}f/{obs.counters['engine_audio_bytes']}b"
-                                )
-                            continue
-                        
-                        # Encode to base64 and send JSON
-                        payload_b64 = base64.b64encode(pcm8k_chunk).decode("ascii")
-                        media_frame = {
-                            "event": "media",
-                            "media": {"payload": payload_b64}
-                        }
-                        
-                        try:
+                            try:
 
-                            
-                            await exotel_ws.send(json.dumps(media_frame))
-                            
-                            # Diagnostics: Update egress stats
-                            now = time.time()
-                            if diagnostics["engine_audio_frames"] == 0:
-                                diagnostics["first_engine_audio_ts"] = now
-                                if diagnostics["last_exotel_in_ts"]:
-                                    latency_ms = (now - diagnostics["last_exotel_in_ts"]) * 1000
-                                    logger.info(
-                                        f"[METRIC][{AUDIO_PIPELINE_MODE.upper()}][FIRST_AUDIO_LATENCY]={latency_ms:.1f}ms "
-                                        f"at {now:.3f}"
-                                    )
-                                else:
-                                    logger.info(f"[DIAG] FIRST_ENGINE_AUDIO at {now:.3f}")
-                            
-                            diagnostics["last_engine_audio_ts"] = now
-                            diagnostics["engine_audio_frames"] += 1
-                            exotel_send_frames += 1
-                            exotel_send_bytes += len(pcm8k_chunk)
-                            last_exotel_outbound_ts = time.monotonic()
-                            obs.update_counter('exotel_out_frames', delta=1, bytes_delta=len(pcm8k_chunk))
-                            obs.update_activity('exotel_out')
-                            last_exotel_out_time = time.monotonic()
-                            
-                            # Artifact capture
-                            if capture_enabled and 'exotel_out' in capture_files:
-                                cap = capture_files['exotel_out']
-                                if cap['size'] < cap['max']:
-                                    cap['file'].write(pcm8k_chunk)
-                                    cap['size'] += len(pcm8k_chunk)
-                            
-                            if exotel_send_frames <= 10:
-                                logger.info(f"✓ Sent frame {exotel_send_frames} to Exotel: {len(pcm8k_chunk)} bytes")
-                        except Exception as e:
-                            logger.error(f"Failed to send to Exotel: {e}", exc_info=True)
-                            raise
+                                
+                                await exotel_ws.send(json.dumps(media_frame))
+                                
+                                # Diagnostics: Update egress stats
+                                now = time.time()
+                                
+                                # Only track engine audio metrics for real audio (not silence)
+                                if not is_silence:
+                                    if diagnostics["engine_audio_frames"] == 0:
+                                        diagnostics["first_engine_audio_ts"] = now
+                                        if diagnostics["last_exotel_in_ts"]:
+                                            latency_ms = (now - diagnostics["last_exotel_in_ts"]) * 1000
+                                            logger.info(
+                                                f"[METRIC][{AUDIO_PIPELINE_MODE.upper()}][FIRST_AUDIO_LATENCY]={latency_ms:.1f}ms "
+                                                f"at {now:.3f}"
+                                            )
+                                        else:
+                                            logger.info(f"[DIAG] FIRST_ENGINE_AUDIO at {now:.3f}")
+                                    
+                                    diagnostics["last_engine_audio_ts"] = now
+                                    diagnostics["engine_audio_frames"] += 1
+                                
+                                # Always track Exotel output (both real audio and silence)
+                                exotel_send_frames += 1
+                                exotel_send_bytes += len(pcm8k_chunk)
+                                last_exotel_outbound_ts = time.monotonic()
+                                obs.update_counter('exotel_out_frames', delta=1, bytes_delta=len(pcm8k_chunk))
+                                obs.update_activity('exotel_out')
+                                last_exotel_out_time = time.monotonic()
+                                
+                                # Artifact capture
+                                if capture_enabled and 'exotel_out' in capture_files:
+                                    cap = capture_files['exotel_out']
+                                    if cap['size'] < cap['max']:
+                                        cap['file'].write(pcm8k_chunk)
+                                        cap['size'] += len(pcm8k_chunk)
+                                
+                                if exotel_send_frames <= 10:
+                                    logger.info(f"✓ Sent frame {exotel_send_frames} to Exotel: {len(pcm8k_chunk)} bytes")
+                            except websockets.exceptions.ConnectionClosedError as e:
+                                logger.info(
+                                    "[exotel_send_loop] Exotel WebSocket closed during send "
+                                    f"(code={getattr(e, 'code', None)}). Treating as normal termination."
+                                )
+                                break   # CLEAN EXIT — DO NOT RAISE
+                            except Exception:
+                                logger.exception("[exotel_send_loop] unexpected send error")
+                                break
                 except Exception as e:
                     logger.error(f"exotel_send_loop error: {e}", exc_info=True)
                     raise
                 finally:
-                    logger.info(f"EXOTEL_SEND frames={exotel_send_frames} bytes={exotel_send_bytes}")
+                    logger.info(f"EXOTEL_SEND frames={exotel_send_frames} bytes={exotel_send_bytes} cadence_silence={cadence_silence_frames}")
+            
             
             # Start all stages (4 tasks: recv, feed, read, send)
             logger.info("Starting engine_to_exotel tasks: engine_recv, ffmpeg_feed, ffmpeg_read, exotel_send")
